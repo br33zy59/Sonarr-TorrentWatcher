@@ -14,6 +14,8 @@ This watcher fills that gap by:
 - marking matching releases as failed in Sonarr (blacklist behavior)
 - optionally deleting the offending torrent from qBittorrent after Sonarr handling
 
+[More elaborate solutions are available if you need them](https://github.com/Cleanuparr/Cleanuparr). This script is designed to be a simple fix for this specific problem.
+
 ## Features
 
 - category-based torrent filtering in qBittorrent
