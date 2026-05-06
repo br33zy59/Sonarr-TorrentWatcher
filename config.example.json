@@ -1,0 +1,28 @@
+{
+  "qbit": {
+    "url": "http://127.0.0.1:8080",
+    "username": "admin",
+    "password": "change-me"
+  },
+  "sonarr": {
+    "url": "http://127.0.0.1:8989",
+    "api_key": "change-me"
+  },
+  "watch": {
+    "category": "tv-sonarr",
+    "extensions": [
+      ".exe",
+      ".scr"
+    ]
+  },
+  "runtime": {
+    "poll_interval_seconds": 20,
+    "request_timeout_seconds": 10,
+    "min_torrent_age_seconds": 60,
+    "sonarr_history_page_size": 200,
+    "dry_run": true,
+    "delete_from_qbit_on_blacklist": true,
+    "log_file": "torrentwatcher.log",
+    "log_level": "INFO"
+  }
+}
