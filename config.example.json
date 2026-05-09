@@ -12,7 +12,8 @@
     "category": "tv-sonarr",
     "extensions": [
       ".exe",
-      ".scr"
+      ".scr",
+      ".lnk"
     ]
   },
   "runtime": {
@@ -23,6 +24,9 @@
     "dry_run": true,
     "delete_from_qbit_on_blacklist": true,
     "log_file": "torrentwatcher.log",
-    "log_level": "INFO"
+    "// console_log_level": "Valid choices: NOTSET | DEBUG | INFO | WARNING | WARN | ERROR | CRITICAL. INFO is recommended for visible loop activity.",
+    "console_log_level": "INFO",
+    "// file_log_level": "Valid choices: NOTSET | DEBUG | INFO | WARNING | WARN | ERROR | CRITICAL. WARNING is recommended to avoid repeated loop-noise in log files.",
+    "file_log_level": "WARNING"
   }
 }

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import time
 import ctypes
 from dataclasses import dataclass
@@ -12,6 +13,41 @@ from requests import Response
 
 
 DEFAULT_CONFIG_PATH = "config.local.json"
+_DEFAULT_CONSOLE_LOG_LEVEL = "INFO"
+_DEFAULT_FILE_LOG_LEVEL = "WARNING"
+_VALID_LOG_LEVELS = frozenset({"NOTSET", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_VALID_LOG_LEVELS_MESSAGE = "NOTSET, DEBUG, INFO, WARNING, WARN, ERROR, CRITICAL"
+
+
+def parse_log_level(raw: Any, *, default: str, field_name: str) -> str:
+    if raw is None:
+        print(
+            f"arr-torrentwatcher: Invalid {field_name}=null; valid values are {_VALID_LOG_LEVELS_MESSAGE}. "
+            f"Using {default}.",
+            file=sys.stderr,
+        )
+        return default
+
+    candidate = str(raw).strip().upper()
+    if not candidate:
+        print(
+            f"arr-torrentwatcher: Invalid {field_name} (empty); valid values are {_VALID_LOG_LEVELS_MESSAGE}. "
+            f"Using {default}.",
+            file=sys.stderr,
+        )
+        return default
+
+    if candidate == "WARN":
+        return "WARNING"
+    if candidate in _VALID_LOG_LEVELS:
+        return candidate
+
+    print(
+        f"arr-torrentwatcher: Invalid {field_name}={raw!r}; valid values are {_VALID_LOG_LEVELS_MESSAGE}. "
+        f"Using {default}.",
+        file=sys.stderr,
+    )
+    return default
 
 
 @dataclass(frozen=True)
@@ -30,7 +66,8 @@ class Config:
     dry_run: bool
     delete_from_qbit_on_blacklist: bool
     log_file: str
-    log_level: str
+    console_log_level: str
+    file_log_level: str
 
 
 def _normalize_url(url: str) -> str:
@@ -46,6 +83,16 @@ def load_config() -> Config:
     sonarr = data["sonarr"]
     watch = data["watch"]
     runtime = data["runtime"]
+    console_log_level = parse_log_level(
+        runtime.get("console_log_level", _DEFAULT_CONSOLE_LOG_LEVEL),
+        default=_DEFAULT_CONSOLE_LOG_LEVEL,
+        field_name="console_log_level",
+    )
+    file_log_level = parse_log_level(
+        runtime.get("file_log_level", _DEFAULT_FILE_LOG_LEVEL),
+        default=_DEFAULT_FILE_LOG_LEVEL,
+        field_name="file_log_level",
+    )
 
     return Config(
         qbit_url=_normalize_url(qbit["url"]),
@@ -62,7 +109,8 @@ def load_config() -> Config:
         dry_run=bool(runtime.get("dry_run", False)),
         delete_from_qbit_on_blacklist=bool(runtime.get("delete_from_qbit_on_blacklist", True)),
         log_file=str(runtime.get("log_file", "arr-torrentwatcher.log")),
-        log_level=str(runtime.get("log_level", "INFO")).upper(),
+        console_log_level=console_log_level,
+        file_log_level=file_log_level,
     )
 
 
@@ -108,7 +156,7 @@ def _enable_windows_ansi_colors() -> None:
 
 
 def setup_logging(config: Config) -> None:
-    logger.setLevel(getattr(logging, config.log_level, logging.INFO))
+    logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     _enable_windows_ansi_colors()
 
@@ -120,10 +168,12 @@ def setup_logging(config: Config) -> None:
         backupCount=3,
         encoding="utf-8",
     )
+    file_handler.setLevel(getattr(logging, config.file_log_level))
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler()
+    console_handler.setLevel(getattr(logging, config.console_log_level))
     console_handler.setFormatter(ColorConsoleFormatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(console_handler)
 
@@ -131,7 +181,7 @@ def setup_logging(config: Config) -> None:
 def _log_response(context: str, response: Response, *, include_body: bool = False) -> None:
     if include_body:
         body = response.text.strip().replace("\n", " ")
-        logger.info(
+        logger.debug(
             "%s response status=%s body=%s",
             context,
             response.status_code,
@@ -139,7 +189,7 @@ def _log_response(context: str, response: Response, *, include_body: bool = Fals
         )
         return
 
-    logger.info("%s response status=%s", context, response.status_code)
+    logger.debug("%s response status=%s", context, response.status_code)
 
 
 def _raise_for_status_with_context(
@@ -318,7 +368,103 @@ def qb_delete_torrent(session: requests.Session, config: Config, torrent_hash: s
     return True
 
 
-def watcher_loop() -> None:
+def run_scan_pass(
+    qbit_session: requests.Session,
+    sonarr_session: requests.Session,
+    config: Config,
+    processed: set[str],
+    scan_iteration: int,
+) -> None:
+    logger.info("Scan #%s starting...", scan_iteration)
+
+    torrents = get_torrents(qbit_session, config)
+    logger.info("qBittorrent returned %s torrents.", len(torrents))
+
+    categorized_count = 0
+    pending_categorized_count = 0
+    suspicious_count = 0
+    for torrent in torrents:
+        torrent_hash = str(torrent.get("hash", ""))
+        if not torrent_hash:
+            continue
+
+        category = parse_category(str(torrent.get("category", "")))
+        if category != config.watch_category:
+            continue
+
+        categorized_count += 1
+        if torrent_hash in processed:
+            continue
+
+        pending_categorized_count += 1
+        torrent_age_seconds = get_torrent_age_seconds(torrent)
+        if (
+            torrent_age_seconds is not None
+            and torrent_age_seconds < config.min_torrent_age_seconds
+        ):
+            logger.debug(
+                "Deferring torrent hash=%s because it is too new (age=%ss, minimum=%ss).",
+                torrent_hash,
+                torrent_age_seconds,
+                config.min_torrent_age_seconds,
+            )
+            continue
+
+        files = get_torrent_files(qbit_session, config, torrent_hash)
+        if not files:
+            logger.debug(
+                "Deferring torrent hash=%s because qBittorrent file list is empty; will retry next pass.",
+                torrent_hash,
+            )
+            continue
+
+        if not torrent_has_watched_extension(files, config.watch_extensions):
+            continue
+
+        suspicious_count += 1
+        torrent_name = str(torrent.get("name", ""))
+        logger.warning(
+            "Categorized torrent with banned content detected hash=%s name=%r category=%r size=%r state=%r",
+            torrent_hash,
+            torrent_name,
+            category,
+            torrent.get("size"),
+            torrent.get("state"),
+        )
+        if sonarr_blacklist_download_id(sonarr_session, config, torrent_hash):
+            if config.delete_from_qbit_on_blacklist:
+                qb_delete_torrent(qbit_session, config, torrent_hash)
+            processed.add(torrent_hash)
+
+    logger.info(
+        "Scan #%s summary: %s torrents detected with category %r, "
+        "%s unprocessed categorized torrents checked, %s suspicious categorized torrents found, "
+        "%s total torrents already processed.",
+        scan_iteration,
+        categorized_count,
+        config.watch_category,
+        pending_categorized_count,
+        suspicious_count,
+        len(processed),
+    )
+
+
+def parse_run_mode(argv: list[str]) -> str:
+    if len(argv) < 2:
+        return "loop"
+
+    mode = argv[1].strip().lower()
+    if mode in {"loop", "oneshot"}:
+        return mode
+
+    print(
+        "arr-torrentwatcher: invalid mode argument. Use 'loop' or 'oneshot'.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+def watcher_loop(run_mode: str) -> None:
     config = load_config()
     setup_logging(config)
     qbit_session = requests.Session()
@@ -329,8 +475,9 @@ def watcher_loop() -> None:
     qb_login(qbit_session, config)
     logger.info("Successfully connected to qBittorrent.")
     logger.info(
-        "Watcher started (category=%r, extensions=%s, poll=%ss, min_torrent_age=%ss, dry_run=%s, timeout=%ss, "
-        "delete_from_qbit_on_blacklist=%s, log_file=%s).",
+        "Watcher started mode=%s (category=%r, extensions=%s, poll=%ss, min_torrent_age=%ss, dry_run=%s, "
+        "timeout=%ss, delete_from_qbit_on_blacklist=%s, log_file=%s).",
+        run_mode,
         config.watch_category,
         config.watch_extensions,
         config.poll_interval_seconds,
@@ -345,78 +492,10 @@ def watcher_loop() -> None:
     try:
         while True:
             scan_iteration += 1
-            logger.info("Scan #%s starting...", scan_iteration)
-
-            torrents = get_torrents(qbit_session, config)
-            logger.info("qBittorrent returned %s torrents.", len(torrents))
-
-            categorized_count = 0
-            pending_categorized_count = 0
-            suspicious_count = 0
-            for torrent in torrents:
-                torrent_hash = str(torrent.get("hash", ""))
-                if not torrent_hash:
-                    continue
-
-                category = parse_category(str(torrent.get("category", "")))
-                if category != config.watch_category:
-                    continue
-
-                categorized_count += 1
-                if torrent_hash in processed:
-                    continue
-
-                pending_categorized_count += 1
-                torrent_age_seconds = get_torrent_age_seconds(torrent)
-                if (
-                    torrent_age_seconds is not None
-                    and torrent_age_seconds < config.min_torrent_age_seconds
-                ):
-                    logger.info(
-                        "Deferring torrent hash=%s because it is too new (age=%ss, minimum=%ss).",
-                        torrent_hash,
-                        torrent_age_seconds,
-                        config.min_torrent_age_seconds,
-                    )
-                    continue
-
-                files = get_torrent_files(qbit_session, config, torrent_hash)
-                if not files:
-                    logger.info(
-                        "Deferring torrent hash=%s because qBittorrent file list is empty; will retry next pass.",
-                        torrent_hash,
-                    )
-                    continue
-
-                if not torrent_has_watched_extension(files, config.watch_extensions):
-                    continue
-
-                suspicious_count += 1
-                torrent_name = str(torrent.get("name", ""))
-                logger.warning(
-                    "Categorized torrent with banned content detected hash=%s name=%r category=%r size=%r state=%r",
-                    torrent_hash,
-                    torrent_name,
-                    category,
-                    torrent.get("size"),
-                    torrent.get("state"),
-                )
-                if sonarr_blacklist_download_id(sonarr_session, config, torrent_hash):
-                    if config.delete_from_qbit_on_blacklist:
-                        qb_delete_torrent(qbit_session, config, torrent_hash)
-                    processed.add(torrent_hash)
-
-            logger.info(
-                "Scan #%s summary: %s torrents detected with category %r, "
-                "%s unprocessed categorized torrents checked, %s suspicious categorized torrents found, "
-                "%s total torrents already processed.",
-                scan_iteration,
-                categorized_count,
-                config.watch_category,
-                pending_categorized_count,
-                suspicious_count,
-                len(processed),
-            )
+            run_scan_pass(qbit_session, sonarr_session, config, processed, scan_iteration)
+            if run_mode == "oneshot":
+                logger.info("One-shot run complete. Exiting.")
+                break
             logger.info("Sleeping %ss before next scan.", config.poll_interval_seconds)
             time.sleep(config.poll_interval_seconds)
     except KeyboardInterrupt:
@@ -430,4 +509,4 @@ def watcher_loop() -> None:
 
 
 if __name__ == "__main__":
-    watcher_loop()
+    watcher_loop(parse_run_mode(sys.argv))
