@@ -372,7 +372,6 @@ def run_scan_pass(
     qbit_session: requests.Session,
     sonarr_session: requests.Session,
     config: Config,
-    processed: set[str],
     scan_iteration: int,
 ) -> None:
     logger.info("Scan #%s starting...", scan_iteration)
@@ -393,9 +392,6 @@ def run_scan_pass(
             continue
 
         categorized_count += 1
-        if torrent_hash in processed:
-            continue
-
         pending_categorized_count += 1
         torrent_age_seconds = get_torrent_age_seconds(torrent)
         if (
@@ -434,18 +430,15 @@ def run_scan_pass(
         if sonarr_blacklist_download_id(sonarr_session, config, torrent_hash):
             if config.delete_from_qbit_on_blacklist:
                 qb_delete_torrent(qbit_session, config, torrent_hash)
-            processed.add(torrent_hash)
 
     logger.info(
         "Scan #%s summary: %s torrents detected with category %r, "
-        "%s unprocessed categorized torrents checked, %s suspicious categorized torrents found, "
-        "%s total torrents already processed.",
+        "%s categorized torrents checked, %s suspicious categorized torrents found.",
         scan_iteration,
         categorized_count,
         config.watch_category,
         pending_categorized_count,
         suspicious_count,
-        len(processed),
     )
 
 
@@ -469,7 +462,6 @@ def watcher_loop(run_mode: str) -> None:
     setup_logging(config)
     qbit_session = requests.Session()
     sonarr_session = requests.Session()
-    processed: set[str] = set()
 
     logger.info("Loading config from %s", os.environ.get("ARR_TW_CONFIG", DEFAULT_CONFIG_PATH))
     qb_login(qbit_session, config)
@@ -492,7 +484,7 @@ def watcher_loop(run_mode: str) -> None:
     try:
         while True:
             scan_iteration += 1
-            run_scan_pass(qbit_session, sonarr_session, config, processed, scan_iteration)
+            run_scan_pass(qbit_session, sonarr_session, config, scan_iteration)
             if run_mode == "oneshot":
                 logger.info("One-shot run complete. Exiting.")
                 break
