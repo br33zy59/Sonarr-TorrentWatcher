@@ -15,6 +15,7 @@ from requests import Response
 DEFAULT_CONFIG_PATH = "config.local.json"
 _DEFAULT_CONSOLE_LOG_LEVEL = "INFO"
 _DEFAULT_FILE_LOG_LEVEL = "WARNING"
+_MAX_SERVICE_BACKOFF_SECONDS = 300
 _VALID_LOG_LEVELS = frozenset({"NOTSET", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _VALID_LOG_LEVELS_MESSAGE = "NOTSET, DEBUG, INFO, WARNING, WARN, ERROR, CRITICAL"
 
@@ -68,6 +69,24 @@ class Config:
     log_file: str
     console_log_level: str
     file_log_level: str
+
+
+@dataclass
+class BackoffState:
+    current_delay_seconds: float = 0.0
+
+    def next_wait_seconds(self, config: Config) -> float:
+        if self.current_delay_seconds <= 0:
+            self.current_delay_seconds = float(config.poll_interval_seconds)
+        else:
+            self.current_delay_seconds = min(
+                self.current_delay_seconds * 2,
+                _MAX_SERVICE_BACKOFF_SECONDS,
+            )
+        return self.current_delay_seconds
+
+    def reset(self) -> None:
+        self.current_delay_seconds = 0.0
 
 
 def _normalize_url(url: str) -> str:
@@ -201,6 +220,84 @@ def _raise_for_status_with_context(
     except requests.HTTPError as exc:
         details = response.text.strip()
         raise RuntimeError(f"{context} failed: {response.status_code} {details}") from exc
+
+
+def is_retryable_api_error(exc: BaseException) -> bool:
+    if isinstance(exc, requests.RequestException):
+        return True
+
+    cause = exc.__cause__
+    while cause is not None:
+        if isinstance(cause, requests.RequestException):
+            return True
+        cause = cause.__cause__
+    return False
+
+
+def _format_api_error(exc: Exception) -> str:
+    message = str(exc).replace("\n", " ").strip()
+    if len(message) > 200:
+        return message[:197] + "..."
+    return message
+
+
+def check_qbit_available(session: requests.Session, config: Config) -> None:
+    qb_login(session, config)
+
+
+def check_sonarr_available(session: requests.Session, config: Config) -> None:
+    response = session.get(
+        f"{config.sonarr_url}/api/v3/system/status",
+        headers={"X-Api-Key": config.sonarr_api_key},
+        timeout=config.request_timeout_seconds,
+    )
+    _raise_for_status_with_context(response, "Sonarr system status")
+
+
+def wait_for_services(
+    qbit_session: requests.Session,
+    sonarr_session: requests.Session,
+    config: Config,
+    backoff: BackoffState,
+) -> None:
+    while True:
+        qbit_error: Exception | None = None
+        sonarr_error: Exception | None = None
+
+        try:
+            check_qbit_available(qbit_session, config)
+        except Exception as exc:
+            if is_retryable_api_error(exc):
+                qbit_error = exc
+            else:
+                raise
+
+        try:
+            check_sonarr_available(sonarr_session, config)
+        except Exception as exc:
+            if is_retryable_api_error(exc):
+                sonarr_error = exc
+            else:
+                raise
+
+        if qbit_error is None and sonarr_error is None:
+            if backoff.current_delay_seconds > 0:
+                logger.info("qBittorrent and Sonarr are available again. Resuming scans.")
+            backoff.reset()
+            return
+
+        delay = backoff.next_wait_seconds(config)
+        unavailable: list[str] = []
+        if qbit_error is not None:
+            unavailable.append(f"qBittorrent ({_format_api_error(qbit_error)})")
+        if sonarr_error is not None:
+            unavailable.append(f"Sonarr ({_format_api_error(sonarr_error)})")
+        logger.warning(
+            "Waiting for services: %s. Retrying in %ss.",
+            "; ".join(unavailable),
+            int(delay),
+        )
+        time.sleep(delay)
 
 
 def qb_login(session: requests.Session, config: Config) -> None:
@@ -462,10 +559,10 @@ def watcher_loop(run_mode: str) -> None:
     setup_logging(config)
     qbit_session = requests.Session()
     sonarr_session = requests.Session()
+    backoff = BackoffState()
+    services_ready_logged = False
 
     logger.info("Loading config from %s", os.environ.get("ARR_TW_CONFIG", DEFAULT_CONFIG_PATH))
-    qb_login(qbit_session, config)
-    logger.info("Successfully connected to qBittorrent.")
     logger.info(
         "Watcher started mode=%s (category=%r, extensions=%s, poll=%ss, min_torrent_age=%ss, dry_run=%s, "
         "timeout=%ss, delete_from_qbit_on_blacklist=%s, log_file=%s).",
@@ -483,8 +580,27 @@ def watcher_loop(run_mode: str) -> None:
     scan_iteration = 0
     try:
         while True:
+            wait_for_services(qbit_session, sonarr_session, config, backoff)
+            if not services_ready_logged:
+                logger.info("Successfully connected to qBittorrent and Sonarr.")
+                services_ready_logged = True
+
             scan_iteration += 1
-            run_scan_pass(qbit_session, sonarr_session, config, scan_iteration)
+            try:
+                run_scan_pass(qbit_session, sonarr_session, config, scan_iteration)
+            except Exception as exc:
+                if not is_retryable_api_error(exc):
+                    raise
+                delay = backoff.next_wait_seconds(config)
+                logger.warning(
+                    "Scan interrupted by unavailable service (%s). Retrying in %ss.",
+                    _format_api_error(exc),
+                    int(delay),
+                )
+                time.sleep(delay)
+                continue
+
+            backoff.reset()
             if run_mode == "oneshot":
                 logger.info("One-shot run complete. Exiting.")
                 break
@@ -492,7 +608,7 @@ def watcher_loop(run_mode: str) -> None:
             time.sleep(config.poll_interval_seconds)
     except KeyboardInterrupt:
         logger.info("Ctrl+C received. Stopping watcher gracefully...")
-    except (requests.RequestException, ValueError, RuntimeError) as exc:
+    except Exception as exc:
         logger.error("Watcher stopped due to error: %s", exc)
     finally:
         qbit_session.close()
