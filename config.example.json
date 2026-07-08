@@ -2,7 +2,9 @@
   "qbit": {
     "url": "http://127.0.0.1:8080",
     "username": "admin",
-    "password": "change-me"
+    "password": "change-me",
+    "// api_key": "qBittorrent v5.2+ supports API keys as an alternative to username/password for web UI authentication. Generate in QBittorrent Settings -> Web UI.",
+    "api_key": ""
   },
   "sonarr": {
     "url": "http://127.0.0.1:8989",

@@ -56,6 +56,7 @@ class Config:
     qbit_url: str
     qbit_user: str
     qbit_pass: str
+    qbit_api_key: str | None
     sonarr_url: str
     sonarr_api_key: str
     watch_category: str
@@ -113,10 +114,23 @@ def load_config() -> Config:
         field_name="file_log_level",
     )
 
+    qbit_api_key_raw = qbit.get("api_key")
+    qbit_api_key = str(qbit_api_key_raw).strip() if qbit_api_key_raw else None
+    if qbit_api_key == "":
+        qbit_api_key = None
+
+    qbit_user = str(qbit.get("username", ""))
+    qbit_pass = str(qbit.get("password", ""))
+    if not qbit_api_key and (not qbit_user or not qbit_pass):
+        raise ValueError(
+            "qbit config requires api_key or both username and password"
+        )
+
     return Config(
         qbit_url=_normalize_url(qbit["url"]),
-        qbit_user=qbit["username"],
-        qbit_pass=qbit["password"],
+        qbit_user=qbit_user,
+        qbit_pass=qbit_pass,
+        qbit_api_key=qbit_api_key,
         sonarr_url=_normalize_url(sonarr["url"]),
         sonarr_api_key=sonarr["api_key"],
         watch_category=str(watch["category"]).lower(),
@@ -242,7 +256,57 @@ def _format_api_error(exc: Exception) -> str:
 
 
 def check_qbit_available(session: requests.Session, config: Config) -> None:
-    qb_login(session, config)
+    qb_authenticate(session, config)
+
+
+def configure_qbit_session(session: requests.Session, config: Config) -> None:
+    session.headers["Referer"] = f"{config.qbit_url}/"
+    if config.qbit_api_key:
+        session.headers["Authorization"] = f"Bearer {config.qbit_api_key}"
+    else:
+        session.headers.pop("Authorization", None)
+
+
+def _session_has_qbit_auth_cookie(session: requests.Session) -> bool:
+    return any(
+        name == "SID" or name.upper().startswith("QBT_SID")
+        for name in session.cookies.keys()
+    )
+
+
+def qb_authenticate(session: requests.Session, config: Config) -> None:
+    configure_qbit_session(session, config)
+
+    if config.qbit_api_key:
+        response = session.get(
+            f"{config.qbit_url}/api/v2/app/version",
+            timeout=config.request_timeout_seconds,
+        )
+        _raise_for_status_with_context(response, "qBittorrent API key validation")
+        return
+
+    response = session.post(
+        f"{config.qbit_url}/api/v2/auth/login",
+        data={"username": config.qbit_user, "password": config.qbit_pass},
+        timeout=config.request_timeout_seconds,
+    )
+    _raise_for_status_with_context(response, "qBittorrent login request")
+
+    if response.status_code == 204 or _session_has_qbit_auth_cookie(session):
+        return
+
+    body = response.text.strip()
+    if body.lower() == "ok.":
+        return
+
+    if response.status_code == 403:
+        raise RuntimeError(
+            "qBittorrent login rejected: IP may be banned after too many failed attempts"
+        )
+    raise RuntimeError(
+        f"qBittorrent login was not accepted (status={response.status_code}, body={body!r}). "
+        "Check username and password in config."
+    )
 
 
 def check_sonarr_available(session: requests.Session, config: Config) -> None:
@@ -298,18 +362,6 @@ def wait_for_services(
             int(delay),
         )
         time.sleep(delay)
-
-
-def qb_login(session: requests.Session, config: Config) -> None:
-    response = session.post(
-        f"{config.qbit_url}/api/v2/auth/login",
-        data={"username": config.qbit_user, "password": config.qbit_pass},
-        timeout=config.request_timeout_seconds,
-    )
-    _raise_for_status_with_context(response, "qBittorrent login request")
-
-    if response.text.strip().lower() != "ok.":
-        raise RuntimeError(f"qBittorrent login was not accepted: {response.text!r}")
 
 
 def get_torrents(session: requests.Session, config: Config) -> list[dict[str, Any]]:
@@ -558,6 +610,7 @@ def watcher_loop(run_mode: str) -> None:
     config = load_config()
     setup_logging(config)
     qbit_session = requests.Session()
+    configure_qbit_session(qbit_session, config)
     sonarr_session = requests.Session()
     backoff = BackoffState()
     services_ready_logged = False

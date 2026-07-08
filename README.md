@@ -22,7 +22,10 @@ Clone the repo with git, or download and extract the release zip to a folder.
 
 Copy `config.example.json` to `config.local.json` and set values to match your environment:
 
-- qBittorrent URL/credentials (get/set this in qBittorrent from Tools -> Options -> Web UI -> Authentication)
+- qBittorrent URL and credentials (Web UI -> Tools -> Options -> Web UI):
+  - `api_key` (qBittorrent v5.2+): preferred; generate in Web UI preferences and set here
+  - or `username` + `password`: cookie-based login (requires Referer header, handled by the script)
+  - provide either `api_key` or both `username` and `password`
 - Sonarr URL/API key (get this in Sonarr from Settings -> General -> Security)
 - watched category and banned extensions
 - runtime settings (poll interval, min torrent age, dry-run, logging)
